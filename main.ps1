@@ -1,4 +1,4 @@
-﻿# ============================================================================
+# ============================================================================
 #  luminosity :: fileless edition
 #  Paste-to-run loader. Nothing touches disk.
 #
@@ -20,7 +20,7 @@ param(
     [switch]$TestMap       # dev: skip auth, decrypt with local key, map, idle
 )
 
-# ── config ──────────────────────────────────────────────────────────────────
+# -- config ------------------------------------------------------------------
 $KaName    = 'Luminosity-fileless'
 $KaOwner   = 'HzZmPin0u1'
 $KaVersion = '1.0'
@@ -29,7 +29,7 @@ $VarName   = 'pl_cfg'          # AES-256 key (64 hex chars), Authenticated varia
 $BlobUrl   = 'https://raw.githubusercontent.com/luminositygg/luminosity-fileless/main/payload.enc'
 $WatchSecs = 300               # session re-check cadence while the cheat runs
 
-# ── ui helpers ──────────────────────────────────────────────────────────────
+# -- ui helpers --------------------------------------------------------------
 $Host.UI.RawUI.WindowTitle = 'luminosity.gg'
 
 function Write-Brand {
@@ -43,12 +43,12 @@ function Write-Ok([string]$m)   { Write-Host "  [+] $m" -ForegroundColor Green }
 function Write-Err([string]$m)  { Write-Host "  [-] $m" -ForegroundColor Red }
 function Write-Info([string]$m) { Write-Host "  [ ] $m" -ForegroundColor Gray }
 
-# ── hwid ────────────────────────────────────────────────────────────────────
+# -- hwid --------------------------------------------------------------------
 # MachineGuid: stable per-Windows-install, no admin needed, 36 chars
 # (KeyAuth app requires >= 20).
 $script:Hwid = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -ErrorAction Stop).MachineGuid
 
-# ── keyauth client (1.3 REST, mirrors lumi_auth_host's SDK) ────────────────
+# -- keyauth client (1.3 REST, mirrors lumi_auth_host's SDK) ----------------
 $script:SessionId = ''
 $script:User      = ''
 $script:Expiry    = 0
@@ -116,7 +116,7 @@ function Format-Expiry([long]$unix) {
     return "$h h $m m"
 }
 
-# ── key system ──────────────────────────────────────────────────────────────
+# -- key system --------------------------------------------------------------
 function Show-KeySystem {
     while ($true) {
         Write-Host ''
@@ -408,7 +408,7 @@ function Install-NativeShim {
     }
 }
 
-# ── payload ─────────────────────────────────────────────────────────────────
+# -- payload -----------------------------------------------------------------
 function Get-PayloadBlob {
     if ($LocalBlob) {
         Write-Info "dev: local blob $LocalBlob"
@@ -442,7 +442,7 @@ function Decrypt-Payload {
     return $dec.TransformFinalBlock($Blob, 16, $Blob.Length - 16)
 }
 
-# ── watchdog: server-side enforcement while the cheat runs ─────────────────
+# -- watchdog: server-side enforcement while the cheat runs -----------------
 # A definitive success:false (revoked / expired / banned) kills the process.
 # Network faults never count as a verdict - the loader build tolerates those
 # too, and killing someone mid-game over lost wifi is worse than the risk.
