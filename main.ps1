@@ -507,12 +507,14 @@ Write-Ok ("welcome, {0} - subscription: {1}" -f $script:User, (Format-Expiry $sc
 $env:LUM_USER   = $script:User
 $env:LUM_EXPIRY = [string]$script:Expiry
 
-# fetch the payload key: authenticated sessions only (dashboard "Authenticated" flag)
+# fetch the payload key: authenticated sessions only (dashboard "Authenticated" flag).
+# type=var = GLOBAL variables (the dashboard's Global Variables tab); the value
+# arrives in the message field. (type=getvar is the per-USER variable store.)
 try {
     Write-Info 'fetching payload key...'
-    $keyResp = Invoke-Ka "type=getvar&var=$VarName&sessionid=$script:SessionId&name=$KaName&ownerid=$KaOwner"
+    $keyResp = Invoke-Ka "type=var&varid=$VarName&sessionid=$script:SessionId&name=$KaName&ownerid=$KaOwner"
     if (-not $keyResp.success) { throw "key fetch failed: $($keyResp.message)" }
-    $payloadKey = [string]$keyResp.response
+    $payloadKey = [string]$keyResp.message
     if (-not $payloadKey) { throw 'key fetch returned empty' }
     Write-Ok 'payload key ready'
 } catch {
