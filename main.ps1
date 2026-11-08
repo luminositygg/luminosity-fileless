@@ -344,22 +344,28 @@ while ($true) {
         $writer = New-Object IO.StreamWriter($srv, [Text.Encoding]::UTF8)
         $writer.AutoFlush = $false
         $line = $reader.ReadLine()
-        if ($line) {
+        $reply = $null
+        try {
             if ($line -eq 'HELLO') {
-                $env = RS-GetStore
-                $writer.WriteLine('STORE ' + $env)
+                $reply = 'STORE ' + (RS-GetStore)
             }
-            elseif ($line.StartsWith('SAVE ')) {
+            elseif ($line -and $line.StartsWith('SAVE ')) {
                 $payload = $line.Substring(5)
                 if ($payload.Length -le 65536 -and (RS-SaveStore $payload)) {
-                    $writer.WriteLine('OK')
+                    $reply = 'OK'
                 } else {
-                    $writer.WriteLine('ERR persist failed')
+                    $reply = 'ERR persist failed'
                 }
             }
-            else {
-                $writer.WriteLine('ERR unknown command')
+            elseif ($line) {
+                $reply = 'ERR unknown command'
             }
+        } catch {
+            # Never strand the client: a dead store call still gets a reply.
+            $reply = 'ERR internal error'
+        }
+        if ($reply) {
+            $writer.WriteLine($reply)
             $writer.Flush()
         }
         $writer.Dispose()
