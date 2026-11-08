@@ -243,7 +243,12 @@ Add-Type -AssemblyName System.IO.Compression  # gzip for the store blob
 function Start-CfgStoreServer {
     param([string]$SessionId)
 
-    $pipeName = 'lumcfg_' + (-join ((1..8) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))
+    # Fixed name: the mapped image runs inside Roblox, whose process env
+    # does not inherit the host's variables, so a random per-session name
+    # is invisible to the DLL (LUM_USER/EXPIRY reach it only via the shim's
+    # hardcoded copy list, and LUM_CFGPIPE never made that list). Deterministic
+    # per-machine name is safe: single HWID-locked session per machine.
+    $pipeName = 'lumcfg_store'
     $env:LUM_CFGPIPE = $pipeName
 
     $script = @'
