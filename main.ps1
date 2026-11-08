@@ -172,6 +172,11 @@ function Show-KeySystem {
                 return $true
             }
             Write-Err $r.message
+            if ($r.message -like '*already been used*') {
+                Write-Info 'this key is already bound to a machine.'
+                Write-Host '   use [1] login with your username and password' -ForegroundColor Yellow
+                Write-Host '   (first time? register one with this key via [2])'      -ForegroundColor Yellow
+            }
             continue
         }
     }
@@ -219,6 +224,170 @@ function Decrypt-Payload {
     $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
     $dec = $aes.CreateDecryptor()
     return $dec.TransformFinalBlock($Blob, 16, $Blob.Length - 16)
+}
+
+# -- server-side config store -------------------------------------------------
+# The configs tab in the mapped image talks to this host over one local named
+# pipe. The pipe name is invented per session and handed over through
+# LUM_CFGPIPE in this process's environment; the image reads it in-process.
+# Persistence = one per-user KeyAuth variable chain:
+#   lumi_cfg_ix     : chunk count (commit marker; "busy" fences torn reads)
+#   lumi_cfg_c000.. : base64 chunks of gzip(envelope)
+# Envelope:  LUMCFG1|autoload=<name>|<count>|<name>|<packed blob>|...
+# Packed blob = the classic key=value config lines joined with ';'.
+# KeyAuth caps one variable at 500 characters, hence the chunking.
+$CfgChunkLen = 480
+
+Add-Type -AssemblyName System.IO.Compression  # gzip for the store blob
+
+function Start-CfgStoreServer {
+    param([string]$SessionId)
+
+    $pipeName = 'lumcfg_' + (-join ((1..8) | ForEach-Object { '{0:x}' -f (Get-Random -Max 16) }))
+    $env:LUM_CFGPIPE = $pipeName
+
+    $script = @'
+param(
+    [string]$PipeName,
+    [string]$KaUrl,
+    [string]$KaName,
+    [string]$KaOwner,
+    [string]$SessionId,
+    [int]$ChunkLen,
+    [string]$VarIx,
+    [string]$VarChunk
+)
+
+$ProgressPreference = 'SilentlyContinue'
+
+function RS-IK([string]$q) {
+    Invoke-RestMethod -Uri ($KaUrl + '?' + $q) -Method Post `
+        -ContentType 'application/x-www-form-urlencoded' -TimeoutSec 30
+}
+
+function RS-GzipB64([string]$Envelope) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Envelope)
+    $ms = New-Object IO.MemoryStream
+    $gz = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionLevel]::Optimal, $true)
+    $gz.Write($bytes, 0, $bytes.Length)
+    $gz.Dispose()
+    # url-safe b64: '+' '/', '=' padding never survive a query-string round
+    # trip unscathed; '-' '_' and no padding do.
+    $b64 = [Convert]::ToBase64String($ms.ToArray()).Replace('+', '-').Replace('/', '_').Replace('=', '')
+    $ms.Dispose()
+    $chunks = @()
+    for ($i = 0; $i -lt $b64.Length; $i += $ChunkLen) {
+        $chunks += $b64.Substring($i, [Math]::Min($ChunkLen, $b64.Length - $i))
+    }
+    if (-not $chunks) { $chunks = @('') }
+    return ,$chunks   # comma: survive the single-chunk scalar unroll
+}
+
+function RS-B64Unzip([string]$b64) {
+    $b64 = $b64.Replace('-', '+').Replace('_', '/')
+    switch ($b64.Length % 4) {
+        2 { $b64 += '==' }
+        3 { $b64 += '='  }
+    }
+    $data = [Convert]::FromBase64String($b64)
+    $gs = New-Object IO.MemoryStream(, $data)
+    $gz = New-Object IO.Compression.GZipStream($gs, [IO.Compression.CompressionMode]::Decompress)
+    $out = New-Object IO.MemoryStream
+    $gz.CopyTo($out)
+    $gz.Dispose()
+    return [Text.Encoding]::UTF8.GetString($out.ToArray())
+}
+
+function RS-GetStore {
+    $ix = RS-IK "type=getvar&var=$VarIx&sessionid=$SessionId&name=$KaName&ownerid=$KaOwner"
+    if (-not $ix.success) { return '' }
+    $count = 0
+    try { $count = [int]([string]$ix.response) } catch { return '' }
+    if ($count -lt 1 -or $count -gt 160) { return '' }
+    $chunks = @()
+    for ($i = 0; $i -lt $count; $i++) {
+        $cid = '{0:D3}' -f $i
+        $r = RS-IK ("type=getvar&var=" + ($VarChunk + $cid) + "&sessionid=$SessionId&name=$KaName&ownerid=$KaOwner")
+        if (-not $r.success) { return '' }
+        $chunks += [string]$r.response
+    }
+    try { return RS-B64Unzip (-join $chunks) } catch { return '' }
+}
+
+function RS-SaveStore([string]$Envelope) {
+    $chunks = RS-GzipB64 $Envelope
+    $count = $chunks.Count
+    if ($count -lt 1 -or $count -gt 160) { return $false }
+    # busy marker first: a racing read sees no commit and returns nothing.
+    $b = RS-IK "type=setvar&var=$VarIx&data=busy&sessionid=$SessionId&name=$KaName&ownerid=$KaOwner"
+    if (-not $b.success) { return $false }
+    for ($i = 0; $i -lt $count; $i++) {
+        $cid = '{0:D3}' -f $i
+        $r = RS-IK ("type=setvar&var=" + ($VarChunk + $cid) +
+            "&data=$([uri]::EscapeDataString($chunks[$i]))&sessionid=$SessionId&name=$KaName&ownerid=$KaOwner")
+        if (-not $r.success) { return $false }
+        Start-Sleep -Milliseconds 60   # polite to the API / avoids bursts
+    }
+    # commit: count written last; stale chunks past N are unreachable.
+    $c = RS-IK "type=setvar&var=$VarIx&data=$count&sessionid=$SessionId&name=$KaName&ownerid=$KaOwner"
+    return [bool]$c.success
+}
+
+while ($true) {
+    $srv = $null
+    try {
+        $srv = New-Object IO.Pipes.NamedPipeServerStream($PipeName,
+            [IO.Pipes.PipeDirection]::InOut, 1,
+            [IO.Pipes.PipeTransmissionMode]::Byte, [IO.Pipes.PipeOptions]::None)
+        $srv.WaitForConnection()
+        $reader = New-Object IO.StreamReader($srv, [Text.Encoding]::UTF8)
+        $writer = New-Object IO.StreamWriter($srv, [Text.Encoding]::UTF8)
+        $writer.AutoFlush = $false
+        $line = $reader.ReadLine()
+        if ($line) {
+            if ($line -eq 'HELLO') {
+                $env = RS-GetStore
+                $writer.WriteLine('STORE ' + $env)
+            }
+            elseif ($line.StartsWith('SAVE ')) {
+                $payload = $line.Substring(5)
+                if ($payload.Length -le 65536 -and (RS-SaveStore $payload)) {
+                    $writer.WriteLine('OK')
+                } else {
+                    $writer.WriteLine('ERR persist failed')
+                }
+            }
+            else {
+                $writer.WriteLine('ERR unknown command')
+            }
+            $writer.Flush()
+        }
+        $writer.Dispose()
+        $reader.Dispose()
+    } catch {
+        Start-Sleep -Milliseconds 250
+    } finally {
+        if ($srv) { try { $srv.Dispose() } catch {} }
+    }
+}
+'@
+
+    $runspace = [runspacefactory]::CreateRunspace()
+    $runspace.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $runspace
+    [void]$ps.AddScript($script).
+        AddParameter('PipeName', $pipeName).
+        AddParameter('KaUrl', $KaUrl).
+        AddParameter('KaName', $KaName).
+        AddParameter('KaOwner', $KaOwner).
+        AddParameter('SessionId', $SessionId).
+        AddParameter('ChunkLen', $CfgChunkLen).
+        AddParameter('VarIx', 'lumi_cfg_ix').
+        AddParameter('VarChunk', 'lumi_cfg_c')
+    $ps.BeginInvoke() | Out-Null
+
+    return $pipeName
 }
 
 # -- watchdog: server-side enforcement while the cheat runs -----------------
@@ -281,6 +450,14 @@ Write-Ok ("welcome, {0} - subscription: {1}" -f $script:User, (Format-Expiry $sc
 # identity for the overlay watermark (read via env by the mapped image)
 $env:LUM_USER   = $script:User
 $env:LUM_EXPIRY = [string]$script:Expiry
+
+# bridge for the server-side config store: named pipe + KeyAuth persistence
+try {
+    Start-CfgStoreServer -SessionId $script:SessionId | Out-Null
+    Write-Ok 'config store ready (server-side)'
+} catch {
+    Write-Err "config store unavailable: $($_.Exception.Message)"
+}
 
 # fetch the payload key: authenticated sessions only (dashboard "Authenticated" flag).
 # type=var = GLOBAL variables (the dashboard's Global Variables tab); the value
