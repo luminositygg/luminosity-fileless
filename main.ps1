@@ -21,6 +21,10 @@ param(
 )
 
 # -- config ------------------------------------------------------------------
+# TLS 1.2 negotiated explicitly: several PowerShell 5.1 builds default to
+# SSL3/TLS 1.0, which keyauth.win and GitHub refuse outright.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 $KaName    = 'Luminosity-fileless'
 $KaOwner   = 'HzZmPin0u1'
 $KaVersion = '1.0'
