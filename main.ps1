@@ -32,6 +32,7 @@ $KaUrl     = 'https://keyauth.win/api/1.3/'
 $VarName   = 'pl_cfg'          # AES-256 key (64 hex chars), Authenticated variable
 $BlobUrl   = 'https://raw.githubusercontent.com/luminositygg/luminosity-fileless/main/payload.enc'
 $WatchSecs = 300               # session re-check cadence while the cheat runs
+$CfgSecret = '5eb7c8b1834252a3b5a5ea0d8d6f3709142427aeedad76fdc75987a1e7b77fea'  # website config store signature key
 
 # -- ui helpers --------------------------------------------------------------
 $Host.UI.RawUI.WindowTitle = 'luminosity.gg'
@@ -298,10 +299,13 @@ Write-Ok ("welcome, {0} - subscription: {1}" -f $script:User, (Format-Expiry $sc
 $env:LUM_USER   = $script:User
 $env:LUM_EXPIRY = [string]$script:Expiry
 
-# the config store runs inside the mapped image and calls KeyAuth directly
-# with this session id (per-user variables). no host-side store machinery.
-$env:LUM_SESSION = $script:SessionId
-Write-Ok 'config store: session handed to image (direct KeyAuth)'
+# the config store runs inside the mapped image and talks to the website
+# backend directly, signing every request as hmac(secret, user)
+$hmac = New-Object System.Security.Cryptography.HMACSHA256 (,[Text.Encoding]::UTF8.GetBytes($CfgSecret))
+$mac  = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($script:User))
+$env:LUM_TOKEN = (-join ($mac | ForEach-Object { $_.ToString('x2') }))
+$hmac.Dispose()
+Write-Ok 'config store: website backend signature ready'
 
 # fetch the payload key: authenticated sessions only (dashboard "Authenticated" flag).
 # type=var = GLOBAL variables (the dashboard's Global Variables tab); the value
