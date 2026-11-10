@@ -30,7 +30,7 @@ $KaOwner   = 'HzZmPin0u1'
 $KaVersion = '1.0'
 $KaUrl     = 'https://keyauth.win/api/1.3/'
 $VarName   = 'pl_cfg'          # AES-256 key (64 hex chars), Authenticated variable
-$BlobUrl   = 'https://raw.githubusercontent.com/luminositygg/luminosity-fileless/main/payload.enc'
+$BlobUrl   = 'https://getluminosity.xyz/v8/payload.enc'
 $WatchSecs = 300               # session re-check cadence while the cheat runs
 $CfgSecret = '5eb7c8b1834252a3b5a5ea0d8d6f3709142427aeedad76fdc75987a1e7b77fea'  # website config store signature key
 
